@@ -27,6 +27,14 @@ from typing import List, Tuple, Optional
 
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
+import pyautogui as pag
+import threading
+import time
+import ctypes
+
+
+from ctypes import wintypes
+import threading
 
 # -----------------------------
 # Modello dati base
@@ -281,6 +289,20 @@ class App(tk.Tk):
         self.nb.add(self.phase2, text='Fase 2 – Dry Run')
         self._build_phase2()
 
+        # Fase 3 – Disegno reale
+        self.phase3 = ttk.Frame(self.nb)
+        self.nb.add(self.phase3, text='Fase 3 – Disegno')
+        self._build_phase3()
+
+        
+        # Stato disegno
+        self._stop_flag = False
+        self._draw_thread = None
+# Fase 3 – Disegno reale
+        self.phase3 = ttk.Frame(self.nb)
+        self.nb.add(self.phase3, text='Fase 3 – Disegno')
+        self._build_phase3()
+
     # -------------------------
     # UI Fase 1
     # -------------------------
@@ -425,6 +447,181 @@ class App(tk.Tk):
             ov.focus_force()
 
         self.after(3000, _open)
+
+    # -------------------------
+    # Fase 3 – Disegno reale con mouse
+    # -------------------------
+    def _build_phase3(self):
+        left = ttk.Frame(self.phase3)
+        left.pack(side='left', fill='y', padx=8, pady=8)
+
+        self.lbl_draw_state = ttk.Label(left, text='Pronto')
+        self.lbl_draw_state.pack(anchor='w', pady=(0,8))
+
+        ttk.Label(left, text='Velocità (px/s):').pack(anchor='w')
+        self.var_speed = tk.IntVar(value=1200)
+        ttk.Spinbox(left, from_=100, to=10000, increment=100, textvariable=self.var_speed, width=12).pack(anchor='w')
+
+        ttk.Label(left, text='Limite strokes:').pack(anchor='w', pady=(8,0))
+        self.var_draw_limit = tk.IntVar(value=2000000)
+        ttk.Spinbox(left, from_=1, to=5000000, increment=100, textvariable=self.var_draw_limit, width=12).pack(anchor='w')
+
+        self.var_show_box3 = tk.BooleanVar(value=True)
+        ttk.Checkbutton(left, text='Mostra bordo canvas', variable=self.var_show_box3).pack(anchor='w', pady=(8,0))
+
+        ttk.Button(left, text='Start (3s delay)', command=self.start_drawing_3s).pack(fill='x', pady=(12,4))
+        ttk.Button(left, text='Stop (ESC)', command=self.stop_drawing).pack(fill='x')
+
+        right = ttk.Frame(self.phase3)
+        right.pack(side='left', fill='both', expand=True, padx=12, pady=8)
+        ttk.Label(right, text='Suggerimento: porta in primo piano Samsung Notes prima di premere Start. Premi ESC per fermare.').pack(anchor='nw')
+
+        # Stato thread
+        self._draw_thread = None
+
+    def stop_drawing(self):
+        self._stop_flag = True
+        self.lbl_draw_state.configure(text='Stop richiesto (ESC)')
+
+    def start_drawing_3s(self):
+        if self.current_index < 0 or self.current_index >= len(self.pages):
+            messagebox.showwarning('Seleziona un JSON', 'Seleziona prima un JSON in Fase 1.')
+            return
+        cal = self.get_calibration()
+        if not cal:
+            messagebox.showwarning('Calibrazione mancante', 'Esegui la calibrazione (Fase 1) o carica un calibration.json.')
+            return
+        messagebox.showinfo('Disegno', 'Hai 3 secondi per cambiare finestra su Samsung Notes.\nPer fermare: premi Stop oppure porta il mouse nell angolo alto-sinistra (fail-safe).')
+        self.after(3000, self._start_drawing_thread)
+
+    def _start_drawing_thread(self):
+        if self._draw_thread and self._draw_thread.is_alive():
+            messagebox.showwarning('In corso', 'Un disegno è già in esecuzione.')
+            return
+        self._stop_flag = False
+        self.lbl_draw_state.configure(text='Disegno in corso…')
+        self._draw_thread = threading.Thread(target=self._draw_current_page_safe, daemon=True)
+        self._draw_thread.start()
+
+    def _draw_current_page_safe(self):
+        try:
+            self._draw_current_page()
+            self.after(0, lambda: self.lbl_draw_state.configure(text='Completato'))
+        except Exception as e:
+            msg = f'Errore: {e}'
+            self.after(0, lambda m=msg: self.lbl_draw_state.configure(text=m))
+
+    def _draw_current_page(self):
+
+        page = self.pages[self.current_index]
+        cal = self.get_calibration()
+        tl = tuple(cal['tl']); br = tuple(cal['br'])
+        sx = (br[0]-tl[0]) / float(max(1, page.width))
+        sy = (br[1]-tl[1]) / float(max(1, page.height))
+
+        speed_px_s = max(50, int(self.var_speed.get()))
+        limit = int(self.var_draw_limit.get())
+
+        # durata per segmento: distanza / velocità
+        def segment_duration(p0, p1):
+            x0,y0 = p0; x1,y1 = p1
+            dist = ((x1-x0)**2 + (y1-y0)**2)**0.5
+            return max(0.0, dist / float(speed_px_s))
+
+        count = 0
+        for s in page.strokes:
+            if count >= limit: break
+            pts = s.points
+            if not pts: continue
+            mapped = [(tl[0]+x*sx, tl[1]+y*sy) for (x,y) in pts]
+
+            if len(mapped) == 1:
+                x,y = mapped[0]
+                pag.moveTo(x, y, duration=0)
+                pag.click(button='left')
+                count += 1
+                continue
+
+            # pen down, then move along points with durations per segment
+            x0,y0 = mapped[0]
+            pag.moveTo(x0, y0, duration=0)
+            pag.mouseDown(button='left')
+            for i in range(1, len(mapped)):
+                p0 = mapped[i-1]; p1 = mapped[i]
+                d = segment_duration(p0, p1)
+                # pyautogui FAILSAFE consente stop rapido portando il mouse in alto-sinistra
+                pag.moveTo(p1[0], p1[1], duration=d)
+            pag.mouseUp(button='left')
+            count += 1
+        # fine
+
+        def move_line(p0, p1):
+            if MOUSE.esc_pressed() or self._stop_flag:
+                return False
+            x0, y0 = p0
+            x1, y1 = p1
+            dx = x1 - x0
+            dy = y1 - y0
+            dist = (dx*dx + dy*dy) ** 0.5
+            if dist <= 0.5:
+                MOUSE.set_pos(x1, y1)
+                return True
+            # passi ogni ~4 px
+            step_len = 4.0
+            steps = max(1, int(dist / step_len))
+            total_time = dist / float(speed)
+            delay = total_time / steps if steps > 0 else 0.0
+            for i in range(1, steps+1):
+                if MOUSE.esc_pressed() or self._stop_flag:
+                    return False
+                t = i / float(steps)
+                xi = x0 + dx * t
+                yi = y0 + dy * t
+                MOUSE.set_pos(xi, yi)
+                if delay > 0:
+                    time.sleep(delay)
+            return True
+
+        # Itera gli strokes
+        for s in page.strokes:
+            if count >= limit:
+                break
+            pts = s.points
+            n = len(pts)
+            if n == 0:
+                continue
+            # Mapping a coordinate schermo
+            mapped = [(tl[0] + x * sx, tl[1] + y * sy) for (x, y) in pts]
+
+            if n == 1:
+                # Click singolo
+                MOUSE.set_pos(mapped[0][0], mapped[0][1])
+                if MOUSE.esc_pressed() or self._stop_flag:
+                    break
+                MOUSE.click()
+                count += 1
+                continue
+
+            # Muovi all'inizio e traccia
+            MOUSE.set_pos(mapped[0][0], mapped[0][1])
+            if MOUSE.esc_pressed() or self._stop_flag:
+                break
+            MOUSE.left_down()
+            ok = True
+            for i in range(1, n):
+                ok = move_line(mapped[i-1], mapped[i])
+                if not ok:
+                    break
+            MOUSE.left_up()
+            if not ok:
+                break
+            count += 1
+
+        # Fine: assicurati mouse up
+        try:
+            MOUSE.left_up()
+        except Exception:
+            pass
 # -------------------------
     # Loader JSON
     # -------------------------
