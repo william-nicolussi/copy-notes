@@ -1,427 +1,597 @@
 #!/usr/bin/env pythonw
 # -*- coding: utf-8 -*-
 """
-Clean Notes GUI — PDF ➜ Images ➜ B/W
-Fasi implementate in modo robusto e minimale (niente placeholder o '...'):
+Clean Notes GUI — PDF ➜ Images ➜ B/W ➜ Skeleton ➜ Vector Strokes (JSON)
 
-- Fase 1: PDF -> immagini (original/cleaned) con anti‑griglia (HSV) opzionale
-- Fase 2: cleaned -> bianco/nero (bw) con Otsu/Sauvola
+Fase 1: PDF -> immagini (original) con anti‑griglia opzionale -> cleaned
+Fase 2: cleaned -> bianco/nero (bw) con Otsu/Sauvola
+Fase 3: bw -> skeleton (1px) via skimage (skeletonize/medial_axis) -> bw_skel
+Fase 4: skeleton -> vettori (polilinee) con grafo 8‑connesso, RDP semplificazione, sampling -> strokes/*.json
 
-Dipendenze principali (installare in anticipo):
-  pip install pymupdf opencv-python numpy
+Dipendenze:
+  pip install pymupdf opencv-python numpy scikit-image pillow
 
 Note:
-- Rimossi import inutili (json, math, time).
-- Sistemato shadowing di variabili (k_sauvola vs kernel).
-- Nessun ellissi/placeholder: il file è eseguibile così com'è.
+- Il codice è standalone e non dipende dal tuo file precedente. Salva output in sottocartelle della cartella scelta.
+- JSON di output: {"width":W,"height":H,"strokes":[{"type":"polyline","closed":bool,"points":[[x,y],...]},...]}
 """
 
-import threading
+import os, json, math, threading
 from pathlib import Path
+from dataclasses import dataclass
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 
 import numpy as np
 import cv2
+from PIL import Image
 
+# -----------------------
+# Utilities
+# -----------------------
 
-# ============================
-#  Helpers comuni
-# ============================
+def ensure_dirs(base: Path):
+    (base / "original").mkdir(parents=True, exist_ok=True)
+    (base / "cleaned").mkdir(parents=True, exist_ok=True)
+    (base / "bw").mkdir(parents=True, exist_ok=True)
+    (base / "bw_skel").mkdir(parents=True, exist_ok=True)
+    (base / "strokes").mkdir(parents=True, exist_ok=True)
 
-def ensure_dirs(base_dir: Path):
-    base_dir = Path(base_dir)
-    d_orig = base_dir / "original"
-    d_clean = base_dir / "cleaned"
-    d_bw = base_dir / "bw"
-    d_strk = base_dir / "strokes"  # riservato per step futuri
-    for d in (d_orig, d_clean, d_bw, d_strk):
-        d.mkdir(parents=True, exist_ok=True)
-    return d_orig, d_clean, d_bw, d_strk
+def log_append(text_widget: tk.Text, msg: str):
+    text_widget.insert("end", msg + "\n")
+    text_widget.see("end")
+    text_widget.update_idletasks()
 
+# -----------------------
+# Fase 1: PDF ➜ Immagini + Anti-griglia
+# -----------------------
 
-def list_images(folder: Path):
-    exts = (".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp")
-    return sorted([p for p in Path(folder).glob("*") if p.suffix.lower() in exts])
-
-
-def auto_white_background(bw_img: np.ndarray) -> np.ndarray:
-    """Se il bordo medio è scuro, inverte per avere sfondo bianco e segno nero."""
-    border = np.concatenate([bw_img[0, :], bw_img[-1, :], bw_img[:, 0], bw_img[:, -1]])
-    if border.mean() < 127:
-        bw_img = cv2.bitwise_not(bw_img)
-    return bw_img
-
-
-# ============================
-#  Fase 1: PDF -> original/cleaned
-# ============================
-
-def hsv_antigrid_keep_ink(img_bgr: np.ndarray, s_thr=0.26, v_thr=0.65, thicken=2) -> np.ndarray:
-    """
-    Rimuove quadretti preservando l'inchiostro colorato/nero (HSV-like su RGB normalizzato).
-    keep = (saturazione alta) OR (valore scuro)
-    """
-    rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
-    cmax = rgb.max(axis=2)
-    cmin = rgb.min(axis=2)
-    delta = cmax - cmin
+def hsv_antigrid_keep_ink_bgr(img_bgr: np.ndarray, s_thr=0.26, v_thr=0.65, thicken=2) -> np.ndarray:
+    """Preserva inchiostro (S alta o V basso) e schiarisce il resto."""
+    img = img_bgr.astype(np.float32) / 255.0
+    cmax = img.max(axis=2)
+    cmin = img.min(axis=2)
+    delta = cmax - cmin + 1e-6
     s = delta / (cmax + 1e-6)
     v = cmax
-
     keep = (s > float(s_thr)) | (v < float(v_thr))
     if thicken and thicken > 1:
-        k_size = int(thicken)
-        keep = cv2.dilate(
-            keep.astype(np.uint8),
-            cv2.getStructuringElement(cv2.MORPH_RECT, (k_size, k_size)),
-            iterations=1,
-        ).astype(bool)
-
-    out = img_bgr.copy()
-    # I pixel NON keep (griglia/pagina) vengono schiariti/spinti verso bianco
-    mask = ~keep
-    out[mask] = (out[mask].astype(np.float32) * 0.2 + 255 * 0.8).astype(np.uint8)
+        keep = cv2.dilate(keep.astype(np.uint8), np.ones((thicken, thicken), np.uint8), iterations=1).astype(bool)
+    clean = np.ones_like(img)
+    clean[keep] = img[keep]
+    out = (np.clip(clean, 0, 1) * 255.0).astype(np.uint8)
     return out
 
-
-def render_pdf_pages(pdf_path: str, dpi: int, out_dir_original: Path):
-    """Estrae le pagine del PDF come PNG ad alta qualità (PyMuPDF)."""
+def pdf_to_images(pdf_path: Path, dpi: int, base: Path, anti_grid: bool, s_thr: float, v_thr: float, thicken: int, logw: tk.Text):
     try:
         import fitz  # PyMuPDF
     except Exception as e:
-        raise RuntimeError("PyMuPDF non è installato. Installa con: pip install pymupdf") from e
-
-    doc = fitz.open(pdf_path)
-    zoom = dpi / 72.0
-    mat = fitz.Matrix(zoom, zoom)
-
-    out_dir_original.mkdir(parents=True, exist_ok=True)
-    paths = []
+        log_append(logw, f"[ERR] PyMuPDF mancante: {e}")
+        return
+    ensure_dirs(base)
+    doc = fitz.open(pdf_path.as_posix())
+    log_append(logw, f"[F1] Pagine PDF: {doc.page_count}")
     for i, page in enumerate(doc, start=1):
-        pix = page.get_pixmap(matrix=mat, alpha=False)  # niente alpha
-        p = out_dir_original / f"page_{i:03d}.png"
-        pix.save(p.as_posix())
-        paths.append(p)
-    return paths
+        pix = page.get_pixmap(dpi=dpi)
+        img = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.h, pix.w, pix.n)
+        if pix.n == 4:
+            img = cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
+        orig_p = base / "original" / f"page_{i:03d}.png"
+        cv2.imwrite(orig_p.as_posix(), img)
+        if anti_grid:
+            clean = hsv_antigrid_keep_ink_bgr(img, s_thr=s_thr, v_thr=v_thr, thicken=thicken)
+        else:
+            clean = img
+        clean_p = base / "cleaned" / f"page_{i:03d}.png"
+        cv2.imwrite(clean_p.as_posix(), clean)
+        log_append(logw, f"[F1] Salvate original/cleaned pagina {i}")
+    log_append(logw, "[F1] Completato.")
 
+# -----------------------
+# Fase 2: Binarizzazione
+# -----------------------
 
-# ============================
-#  Fase 2: cleaned -> B/W
-# ============================
+def auto_white_background(bw_0_255: np.ndarray) -> np.ndarray:
+    h, w = bw_0_255.shape[:2]
+    border = np.concatenate([
+        bw_0_255[0, :], bw_0_255[-1, :], bw_0_255[:, 0], bw_0_255[:, -1]
+    ])
+    if border.mean() < 127:
+        bw_0_255 = cv2.bitwise_not(bw_0_255)
+    return bw_0_255
 
-def sauvola_threshold(gray: np.ndarray, win=31, k_sauvola=0.2, R=128):
-    """Calcolo Sauvola: soglia locale per binarizzazione di documenti."""
-    gray = gray.astype(np.float32)
-    mean = cv2.boxFilter(gray, ddepth=-1, ksize=(win, win), borderType=cv2.BORDER_REPLICATE)
-    mean_sq = cv2.boxFilter(gray * gray, ddepth=-1, ksize=(win, win), borderType=cv2.BORDER_REPLICATE)
-    var = mean_sq - mean * mean
-    std = cv2.sqrt(np.maximum(var, 0))
-    thresh = mean * (1 + k_sauvola * ((std / R) - 1))
-    bw = (gray > thresh).astype(np.uint8) * 255
-    return bw
+def sauvola_threshold(gray01: np.ndarray, window: int = 25, k: float = 0.2, R: float = 0.5) -> np.ndarray:
+    """Mappa di soglia Sauvola su float [0..1]."""
+    from scipy.ndimage import uniform_filter
+    mean = uniform_filter(gray01, size=window, mode='reflect')
+    mean_sq = uniform_filter(gray01 * gray01, size=window, mode='reflect')
+    var = np.maximum(mean_sq - mean * mean, 0.0)
+    std = np.sqrt(var)
+    th = mean * (1 + k * (std / (R + 1e-6) - 1))
+    return th
 
+def cleaned_to_bw(base: Path, mode: str, fixed: float, sau_w: int, sau_k: float, specks: int, dilate_px: int, logw: tk.Text):
+    ensure_dirs(base)
+    inp = base / "cleaned"
+    out = base / "bw"
+    files = sorted([p for p in inp.glob("*.png")])
+    if not files:
+        log_append(logw, "[F2] Nessuna immagine in cleaned/")
+        return
+    for p in files:
+        img = cv2.imread(p.as_posix(), cv2.IMREAD_COLOR)
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY).astype(np.float32) / 255.0
+        if mode == "fixed":
+            bw = (gray < float(fixed)).astype(np.uint8) * 255
+        elif mode == "otsu":
+            g8 = (gray * 255).astype(np.uint8)
+            _, bw = cv2.threshold(g8, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+            bw = (255 - bw)  # inchiostro nero
+        else:
+            th_map = sauvola_threshold(gray, window=int(sau_w), k=float(sau_k), R=0.5)
+            bw = ((gray < th_map).astype(np.uint8)) * 255
 
-def binarize_image(img_bgr: np.ndarray, method="otsu", win=31, k_sauvola=0.2,
-                   remove_specks=0, dilate_px=0) -> np.ndarray:
-    """Binarizza immagine con Otsu o Sauvola; opzionale rimozione puntinature e dilatazione."""
-    gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
-    if method == "sauvola":
-        bw = sauvola_threshold(gray, win=win, k_sauvola=k_sauvola)
+        if specks and specks > 0:
+            k = cv2.getStructuringElement(cv2.MORPH_RECT, (specks, specks))
+            bw = cv2.morphologyEx(bw, cv2.MORPH_OPEN, k, iterations=1)
+        if dilate_px and dilate_px > 0:
+            k = cv2.getStructuringElement(cv2.MORPH_RECT, (dilate_px, dilate_px))
+            bw = cv2.dilate(bw, k, iterations=1)
+
+        bw = auto_white_background(bw)
+        cv2.imwrite((out / p.name).as_posix(), bw)
+        log_append(logw, f"[F2] bw: {p.name}")
+    log_append(logw, "[F2] Completato.")
+
+# -----------------------
+# Fase 3: Skeleton
+# -----------------------
+
+try:
+    from skimage.morphology import skeletonize as sk_skeletonize, medial_axis, remove_small_objects, binary_closing, square
+    _HAS_SK = True
+except Exception:
+    _HAS_SK = False
+
+def bw_to_skeleton(base: Path, method: str, min_obj: int, do_close: bool, logw: tk.Text):
+    if not _HAS_SK:
+        log_append(logw, "[F3] scikit-image non disponibile.")
+        return
+    ensure_dirs(base)
+    inp = base / "bw"
+    out = base / "bw_skel"
+    files = sorted([p for p in inp.glob("*.png")])
+    if not files:
+        log_append(logw, "[F3] Nessun file in bw/")
+        return
+    for p in files:
+        bw = cv2.imread(p.as_posix(), cv2.IMREAD_GRAYSCALE)
+        mask = (bw < 128)
+        if do_close:
+            mask = binary_closing(mask, square(3))
+        if min_obj and min_obj > 1:
+            mask = remove_small_objects(mask, min_size=int(min_obj))
+        if method == "skeletonize":
+            sk = sk_skeletonize(mask)
+        else:
+            sk, _ = medial_axis(mask, return_distance=True)
+        sk_img = (sk.astype(np.uint8) * 255)
+        cv2.imwrite((out / p.name).as_posix(), 255 - sk_img)  # nero=tratto
+        log_append(logw, f"[F3] skeleton: {p.name}")
+    log_append(logw, "[F3] Completato.")
+
+# -----------------------
+# Fase 4: Vectorization (Skeleton -> Strokes JSON)
+# -----------------------
+
+@dataclass
+class VecParams:
+    dp_tol: float = 1.0      # tolleranza Douglas–Peucker in px
+    min_points: int = 8      # scarta polilinee troppo corte
+    close_gap: int = 2       # ricuce gap (px) tra endpoint
+    sample_step: float = 1.5 # distanza target tra punti consecutivi
+
+def neighbors8(y, x, H, W):
+    for dy in (-1, 0, 1):
+        for dx in (-1, 0, 1):
+            if dy == 0 and dx == 0: 
+                continue
+            ny, nx = y + dy, x + dx
+            if 0 <= ny < H and 0 <= nx < W:
+                yield ny, nx
+
+def build_graph_from_skeleton(mask: np.ndarray, close_gap: int):
+    """mask True=ink skeleton. Restituisce: coords list, adjacency dict {idx: set(idx)}"""
+    H, W = mask.shape
+    coords = []               # idx -> (y,x)
+    index = -np.ones_like(mask, dtype=np.int32)  # -1=non nodo
+    ys, xs = np.where(mask)
+    idx = 0
+    for y, x in zip(ys, xs):
+        index[y, x] = idx
+        coords.append((int(y), int(x)))
+        idx += 1
+    coords = np.array(coords, dtype=np.int32)
+    adj = {i: set() for i in range(idx)}
+    for y, x in zip(ys, xs):
+        i = int(index[y, x])
+        for ny, nx in neighbors8(y, x, H, W):
+            if index[ny, nx] >= 0:
+                j = int(index[ny, nx])
+                if i != j:
+                    adj[i].add(j)
+    # gap closing: collega endpoint vicini entro r
+    if close_gap and close_gap > 0:
+        endpoints = [i for i in range(idx) if len(adj[i]) == 1]
+        # naive: k-d tree semplice con numpy
+        ep_coords = coords[endpoints] if endpoints else np.zeros((0,2), np.int32)
+        for a, ia in enumerate(endpoints):
+            ya, xa = ep_coords[a]
+            # cerca in un quadrato r
+            y0, y1 = max(0, ya-close_gap), min(H-1, ya+close_gap)
+            x0, x1 = max(0, xa-close_gap), min(W-1, xa+close_gap)
+            sub = index[y0:y1+1, x0:x1+1]
+            cand = np.unique(sub[sub>=0])
+            for j in cand:
+                if j == ia: 
+                    continue
+                # collega solo endpoint o pixel molto vicini
+                yb, xb = coords[j]
+                if (abs(ya - yb) + abs(xa - xb)) <= close_gap:
+                    adj[ia].add(int(j))
+                    adj[int(j)].add(ia)
+    return coords, adj, index
+
+def douglas_peucker(points, eps):
+    """RDP su array Nx2 (y,x) — ritorna punti semplificati nell'ordine originale."""
+    if len(points) < 3:
+        return points
+    # distanza punto-linea
+    (y1, x1) = points[0]
+    (y2, x2) = points[-1]
+    vy = y2 - y1
+    vx = x2 - x1
+    vnorm = math.hypot(vy, vx) + 1e-9
+    dmax = -1.0
+    idx = -1
+    for i in range(1, len(points)-1):
+        py, px = points[i]
+        # area parallelogramma / base
+        dist = abs(vy*(px - x1) - vx*(py - y1)) / vnorm
+        if dist > dmax:
+            dmax = dist
+            idx = i
+    if dmax > eps:
+        left = douglas_peucker(points[:idx+1], eps)
+        right = douglas_peucker(points[idx:], eps)
+        return np.vstack([left[:-1], right])
     else:
-        thr, bw = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        return np.array([points[0], points[-1]])
 
-    if remove_specks and remove_specks > 0:
-        nb = remove_specks
-        bw = cv2.morphologyEx(
-            bw, cv2.MORPH_OPEN,
-            cv2.getStructuringElement(cv2.MORPH_RECT, (nb, nb)),
-            iterations=1
-        )
+def resample_polyline(points, step):
+    """Campiona lungo la lunghezza a passo ~step (in px)."""
+    if len(points) <= 2 or step <= 0:
+        return points
+    pts = points.astype(np.float32)
+    dists = np.sqrt(((pts[1:] - pts[:-1])**2).sum(axis=1))
+    cum = np.concatenate([[0.0], np.cumsum(dists)])
+    L = cum[-1]
+    if L <= step:
+        return points
+    targets = np.arange(0.0, L, step)
+    out = []
+    k = 0
+    for t in targets:
+        while not (cum[k] <= t <= cum[k+1]):
+            k += 1
+            if k >= len(dists):
+                break
+        if k >= len(dists):
+            break
+        a, b = pts[k], pts[k+1]
+        seg = cum[k+1] - cum[k]
+        alpha = 0.0 if seg == 0 else (t - cum[k]) / seg
+        out.append(a + alpha*(b - a))
+    out.append(pts[-1])
+    return np.round(np.vstack(out)).astype(np.int32)
 
-    if dilate_px and dilate_px > 0:
-        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (dilate_px, dilate_px))
-        bw = cv2.dilate(bw, kernel, iterations=1)
+def trace_polylines_from_graph(coords: np.ndarray, adj: dict, params: VecParams):
+    N = coords.shape[0]
+    visited_edge = set()  # edges as tuple(min,max)
+    deg = np.array([len(adj[i]) for i in range(N)], dtype=np.int32)
+    endpoints = [i for i in range(N) if deg[i] == 1]
+    junctions = set(i for i in range(N) if deg[i] >= 3)
+    polylines = []
 
-    bw = auto_white_background(bw)
-    return bw
+    def take_edge(a, b):
+        e = (a, b) if a < b else (b, a)
+        if e in visited_edge:
+            return False
+        visited_edge.add(e)
+        return True
 
-
-# ============================
-#  UI
-# ============================
-
-class BaseFrame(ttk.Frame):
-    def log(self, widget, msg: str):
-        widget.insert("end", msg + "\n")
-        widget.see("end")
-        widget.update_idletasks()
-
-
-# --------- Fase 1 UI ---------
-
-class Stage1Frame(BaseFrame):
-    def __init__(self, master, base_out_var: tk.StringVar):
-        super().__init__(master)
-        self.base_out_var = base_out_var
-
-        self.pdf_path = tk.StringVar(value="")
-        self.dpi = tk.IntVar(value=600)
-
-        self.enable_antigrid = tk.BooleanVar(value=True)
-        self.s_thr = tk.DoubleVar(value=0.26)
-        self.v_thr = tk.DoubleVar(value=0.65)
-        self.thicken = tk.IntVar(value=2)
-
-        pad = dict(padx=8, pady=6)
-
-        # File choose
-        frm_pdf = ttk.Frame(self)
-        frm_pdf.pack(fill="x", **pad)
-        ttk.Label(frm_pdf, text="PDF:").pack(side="left")
-        ttk.Entry(frm_pdf, textvariable=self.pdf_path, width=60).pack(side="left", padx=6)
-        ttk.Button(frm_pdf, text="Sfoglia…", command=self.choose_pdf).pack(side="left")
-
-        # Options
-        frm_opts = ttk.LabelFrame(self, text="Opzioni rendering")
-        frm_opts.pack(fill="x", **pad)
-        ttk.Label(frm_opts, text="DPI:").grid(row=0, column=0, sticky="w", **pad)
-        ttk.Entry(frm_opts, textvariable=self.dpi, width=8).grid(row=0, column=1, sticky="w", **pad)
-
-        ttk.Checkbutton(frm_opts, text="Anti-griglia (HSV)", variable=self.enable_antigrid).grid(row=1, column=0, sticky="w", **pad)
-        ttk.Label(frm_opts, text="S soglia:").grid(row=1, column=1, sticky="w", **pad)
-        ttk.Entry(frm_opts, textvariable=self.s_thr, width=8).grid(row=1, column=2, sticky="w", **pad)
-        ttk.Label(frm_opts, text="V soglia:").grid(row=1, column=3, sticky="w", **pad)
-        ttk.Entry(frm_opts, textvariable=self.v_thr, width=8).grid(row=1, column=4, sticky="w", **pad)
-        ttk.Label(frm_opts, text="Thicken px:").grid(row=1, column=5, sticky="w", **pad)
-        ttk.Entry(frm_opts, textvariable=self.thicken, width=8).grid(row=1, column=6, sticky="w", **pad)
-
-        # Run
-        frm_run = ttk.LabelFrame(self, text="Esecuzione")
-        frm_run.pack(fill="both", expand=True, **pad)
-        self.progress = ttk.Progressbar(frm_run, mode="determinate", maximum=100)
-        self.progress.pack(fill="x", padx=8, pady=8)
-        self.logbox = tk.Text(frm_run, height=10)
-        self.logbox.pack(fill="both", expand=True, padx=8, pady=6)
-
-        frm_btns = ttk.Frame(frm_run)
-        frm_btns.pack(fill="x", pady=6)
-        ttk.Button(frm_btns, text="Anteprima (pag.1)", command=self.preview_first).pack(side="left", padx=4)
-        ttk.Button(frm_btns, text="Render tutte le pagine", command=self.start_render).pack(side="left", padx=4)
-
-    def choose_pdf(self):
-        path = filedialog.askopenfilename(filetypes=[("PDF", "*.pdf")])
-        if path:
-            self.pdf_path.set(path)
-
-    def preview_first(self):
-        pdf = self.pdf_path.get().strip()
-        if not pdf:
-            messagebox.showwarning("Attenzione", "Seleziona un PDF.")
+    def walk_from(start):
+        # trova un vicino per partire
+        if not adj[start]:
             return
-        base = Path(self.base_out_var.get().strip())
-        d_orig, d_clean, d_bw, d_strk = ensure_dirs(base)
-        try:
-            pages = render_pdf_pages(pdf, dpi=int(self.dpi.get()), out_dir_original=d_orig)
-            if not pages:
-                messagebox.showerror("Errore", "Nessuna pagina renderizzata.")
-                return
-            p0 = pages[0]
-            img = cv2.imread(str(p0), cv2.IMREAD_COLOR)
-            if self.enable_antigrid.get():
-                img = hsv_antigrid_keep_ink(
-                    img, s_thr=float(self.s_thr.get()),
-                    v_thr=float(self.v_thr.get()),
-                    thicken=int(self.thicken.get())
-                )
-                prev = d_clean / "preview_clean_no_grid.png"
-                cv2.imwrite(str(prev), img)
-                self.log(self.logbox, f"[ANTEPRIMA] Salvata: {prev}")
-                messagebox.showinfo("Anteprima", f"Anteprima salvata:\n{prev}")
+        path = [start]
+        # scegli il primo vicino non visitato
+        nxts = sorted(list(adj[start]), key=lambda j: abs(j-start))
+        prev = start
+        cur = nxts[0]
+        if not take_edge(prev, cur):
+            return
+        path.append(cur)
+        while True:
+            # cerca prossimo vicino diverso da prev
+            neigh = [k for k in adj[cur] if k != prev]
+            # prediligi angolo più piccolo
+            if len(neigh) == 0:
+                break
+            best = None
+            if len(neigh) == 1:
+                cand = neigh[0]
             else:
-                self.log(self.logbox, "[ANTEPRIMA] Anti-griglia OFF: vedi original/")
-        except Exception as e:
-            messagebox.showerror("Errore", str(e))
+                # minimizza deviazione angolare
+                v1 = coords[cur] - coords[prev]
+                ang_best = 1e9
+                cand = neigh[0]
+                for nb in neigh:
+                    v2 = coords[nb] - coords[cur]
+                    num = float(np.dot(v1, v2))
+                    den = (np.linalg.norm(v1)*np.linalg.norm(v2) + 1e-9)
+                    cosang = -num/den  # vogliamo deviazione minima => cos vicino a -1 (continuare dritto)
+                    if cosang < ang_best:
+                        ang_best = cosang
+                        cand = nb
+            if not take_edge(cur, cand):
+                break
+            path.append(cand)
+            prev, cur = cur, cand
+            if cur in junctions:
+                break
+        polylines.append(path)
 
-    def start_render(self):
-        pdf = self.pdf_path.get().strip()
-        base = Path(self.base_out_var.get().strip())
-        dpi = int(self.dpi.get())
-        if not pdf:
-            messagebox.showwarning("Attenzione", "Seleziona un PDF.")
-            return
-        d_orig, d_clean, d_bw, d_strk = ensure_dirs(base)
-        self.progress['value'] = 0
+    # 1) percorsi da endpoint
+    for s in endpoints:
+        # controlla se ha ancora edge liberi
+        free = [j for j in adj[s] if ((min(s,j), max(s,j)) not in visited_edge)]
+        if free:
+            walk_from(s)
 
-        def worker():
-            try:
-                self.log(self.logbox, f"[RENDER] Estraggo pagine da {pdf} @ {dpi} DPI …")
-                pages = render_pdf_pages(pdf, dpi=dpi, out_dir_original=d_orig)
-                n = len(pages)
-                if n == 0:
-                    raise RuntimeError("Nessuna pagina nel PDF.")
-                for i, p in enumerate(pages, start=1):
-                    img = cv2.imread(str(p), cv2.IMREAD_COLOR)
-                    if img is None:
-                        continue
-                    out_img = img
-                    if self.enable_antigrid.get():
-                        out_img = hsv_antigrid_keep_ink(
-                            img,
-                            s_thr=float(self.s_thr.get()),
-                            v_thr=float(self.v_thr.get()),
-                            thicken=int(self.thicken.get())
-                        )
-                    out_p = d_clean / p.name
-                    cv2.imwrite(str(out_p), out_img)
-                    self.progress['value'] = int(i * 100 / n)
-                    self.log(self.logbox, f"[RENDER] {i}/{n} -> {out_p}")
-                messagebox.showinfo("Completato (Fase 1)", "Render completato.")
-            except Exception as e:
-                self.log(self.logbox, f"[ERRORE] {e}")
-                messagebox.showerror("Errore", str(e))
+    # 2) loop residui (nessun endpoint)
+    for i in range(N):
+        for j in adj[i]:
+            e = (min(i,j), max(i,j))
+            if e not in visited_edge:
+                # traccia piccolo ciclo
+                path = [i, j]
+                visited_edge.add(e)
+                prev, cur = i, j
+                while True:
+                    neigh = [k for k in adj[cur] if k != prev]
+                    if not neigh:
+                        break
+                    cand = neigh[0]
+                    e2 = (min(cur, cand), max(cur, cand))
+                    if e2 in visited_edge:
+                        break
+                    visited_edge.add(e2)
+                    path.append(cand)
+                    prev, cur = cur, cand
+                    if cand == i:
+                        break
+                polylines.append(path)
 
-        threading.Thread(target=worker, daemon=True).start()
+    # converti indici in coordinate e applica pulizia/semplificazione
+    out = []
+    for path in polylines:
+        if len(path) < params.min_points:
+            continue
+        pts = coords[np.array(path, dtype=np.int32)][:, ::-1]  # (x,y) per comodità output
+        # RDP in (x,y) ma la nostra distanza usa (y,x); convertiamo
+        pts_yx = pts[:, ::-1]  # (y,x) per coerenza con resample
+        simp = douglas_peucker(pts_yx, params.dp_tol)
+        rs = resample_polyline(simp, params.sample_step)
+        if len(rs) < params.min_points:
+            continue
+        # chiusura se primo/ultimo vicini
+        closed = np.linalg.norm(rs[0] - rs[-1]) <= max(2, int(params.dp_tol*2))
+        # output come (x,y)
+        rs_xy = rs[:, ::-1].tolist()
+        out.append({"type": "polyline", "closed": bool(closed), "points": rs_xy})
+    return out
 
+def skeletons_to_strokes(base: Path, params: VecParams, logw: tk.Text):
+    ensure_dirs(base)
+    inp = base / "bw_skel"
+    out_dir = base / "strokes"
+    files = sorted([p for p in inp.glob("*.png")])
+    if not files:
+        log_append(logw, "[F4] Nessun file in bw_skel/")
+        return
+    for p in files:
+        sk = cv2.imread(p.as_posix(), cv2.IMREAD_GRAYSCALE)
+        # inchiostro nero -> mask True
+        mask = (sk < 128)
+        H, W = mask.shape
+        coords, adj, _ = build_graph_from_skeleton(mask, close_gap=params.close_gap)
+        strokes = trace_polylines_from_graph(coords, adj, params)
+        payload = {
+            "width": int(W),
+            "height": int(H),
+            "strokes": strokes
+        }
+        outp = out_dir / (p.stem + ".json")
+        with open(outp, "w", encoding="utf-8") as f:
+            json.dump(payload, f, separators=(",", ":"), ensure_ascii=False)
+        kb = (outp.stat().st_size + 1023)//1024
+        log_append(logw, f"[F4] strokes: {outp.name} ({kb} KB, {len(strokes)} stroke)")
+    log_append(logw, "[F4] Completato.")
 
-# --------- Fase 2 UI ---------
-
-class Stage2Frame(BaseFrame):
-    def __init__(self, master, base_out_var: tk.StringVar):
-        super().__init__(master)
-        self.base_out_var = base_out_var
-
-        self.method = tk.StringVar(value="otsu")  # 'otsu' | 'sauvola'
-        self.win = tk.IntVar(value=31)
-        self.k = tk.DoubleVar(value=0.2)  # k di Sauvola
-        self.remove_specks = tk.IntVar(value=0)
-        self.dilate = tk.IntVar(value=0)
-
-        pad = dict(padx=8, pady=6)
-
-        frm_top = ttk.LabelFrame(self, text="Parametri")
-        frm_top.pack(fill="x", **pad)
-
-        ttk.Label(frm_top, text="Metodo:").grid(row=0, column=0, sticky="w", **pad)
-        ttk.Radiobutton(frm_top, text="Otsu", variable=self.method, value="otsu").grid(row=0, column=1, sticky="w", **pad)
-        ttk.Radiobutton(frm_top, text="Sauvola", variable=self.method, value="sauvola").grid(row=0, column=2, sticky="w", **pad)
-
-        ttk.Label(frm_top, text="Finestra (Sauvola):").grid(row=1, column=0, sticky="w", **pad)
-        ttk.Entry(frm_top, textvariable=self.win, width=8).grid(row=1, column=1, sticky="w", **pad)
-        ttk.Label(frm_top, text="k (Sauvola):").grid(row=1, column=2, sticky="w", **pad)
-        ttk.Entry(frm_top, textvariable=self.k, width=8).grid(row=1, column=3, sticky="w", **pad)
-
-        ttk.Label(frm_top, text="Rimuovi puntinature ≤").grid(row=2, column=0, sticky="w", **pad)
-        ttk.Entry(frm_top, textvariable=self.remove_specks, width=8).grid(row=2, column=1, sticky="w", **pad)
-        ttk.Label(frm_top, text="Dilatazione px:").grid(row=2, column=2, sticky="w", **pad)
-        ttk.Entry(frm_top, textvariable=self.dilate, width=8).grid(row=2, column=3, sticky="w", **pad)
-
-        frm_run = ttk.LabelFrame(self, text="Esecuzione")
-        frm_run.pack(fill="both", expand=True, **pad)
-        self.progress = ttk.Progressbar(frm_run, mode="determinate", maximum=100)
-        self.progress.pack(fill="x", padx=8, pady=8)
-        self.logbox = tk.Text(frm_run, height=10)
-        self.logbox.pack(fill="both", expand=True, padx=8, pady=6)
-
-        frm_btns = ttk.Frame(frm_run)
-        frm_btns.pack(fill="x", pady=6)
-        ttk.Button(frm_btns, text="Anteprima (prima immagine)", command=self.preview_first).pack(side="left", padx=4)
-        ttk.Button(frm_btns, text="Converti tutte (cleaned → bw)", command=self.convert_all).pack(side="left", padx=4)
-
-    def preview_first(self):
-        base = Path(self.base_out_var.get().strip())
-        d_orig, d_clean, d_bw, d_strk = ensure_dirs(base)
-        imgs = list_images(d_clean)
-        if not imgs:
-            messagebox.showwarning("Attenzione", "Nessuna immagine in 'cleaned'.")
-            return
-        img = cv2.imread(str(imgs[0]), cv2.IMREAD_COLOR)
-        bw = binarize_image(
-            img,
-            method=self.method.get(),
-            win=int(self.win.get()),
-            k_sauvola=float(self.k.get()),
-            remove_specks=int(self.remove_specks.get()),
-            dilate_px=int(self.dilate.get())
-        )
-        prev = d_bw / "preview_bw.png"
-        cv2.imwrite(str(prev), bw)
-        self.log(self.logbox, f"[ANTEPRIMA] Salvata: {prev}")
-        messagebox.showinfo("Anteprima", f"Anteprima salvata:\n{prev}")
-
-    def convert_all(self):
-        base = Path(self.base_out_var.get().strip())
-        d_orig, d_clean, d_bw, d_strk = ensure_dirs(base)
-        imgs = list_images(d_clean)
-        if not imgs:
-            messagebox.showwarning("Attenzione", "Nessuna immagine in 'cleaned'.")
-            return
-
-        self.progress['value'] = 0
-
-        def worker():
-            try:
-                n = len(imgs)
-                for i, p in enumerate(imgs, start=1):
-                    img = cv2.imread(str(p), cv2.IMREAD_COLOR)
-                    if img is None:
-                        continue
-                    bw = binarize_image(
-                        img,
-                        method=self.method.get(),
-                        win=int(self.win.get()),
-                        k_sauvola=float(self.k.get()),
-                        remove_specks=int(self.remove_specks.get()),
-                        dilate_px=int(self.dilate.get())
-                    )
-                    out_p = d_bw / p.name
-                    cv2.imwrite(str(out_p), bw)
-                    self.progress['value'] = int(i * 100 / n)
-                    self.log(self.logbox, f"[BW] {i}/{n} -> {out_p}")
-                messagebox.showinfo("Completato (Fase 2)", "Conversione in B/N terminata.")
-            except Exception as e:
-                self.log(self.logbox, f"[ERRORE] {e}")
-                messagebox.showerror("Errore", str(e))
-
-        threading.Thread(target=worker, daemon=True).start()
-
-
-# --------- App container ---------
+# -----------------------
+# GUI
+# -----------------------
 
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("Clean Notes GUI — PDF → Cleaned → B/W")
-        self.geometry("860x640")
+        self.title("Clean Notes GUI — Fasi 1-4")
+        self.geometry("980x720")
+        self.minsize(900, 650)
 
-        # cartella di output base
-        self.base_out_dir = tk.StringVar(value=str(Path.cwd() / "rendered"))
+        self.base_dir = tk.StringVar(value=str(Path.home() / "CleanNotesOut"))
+        self.pdf_path = tk.StringVar(value="")
+        self.dpi = tk.IntVar(value=600)
+        self.anti_grid = tk.BooleanVar(value=True)
+        self.s_thr = tk.DoubleVar(value=0.26)
+        self.v_thr = tk.DoubleVar(value=0.65)
+        self.thicken = tk.IntVar(value=2)
 
-        # chooser per cartella base
-        top = ttk.Frame(self)
-        top.pack(fill="x", padx=8, pady=8)
-        ttk.Label(top, text="Cartella output:").pack(side="left")
-        ttk.Entry(top, textvariable=self.base_out_dir, width=60).pack(side="left", padx=6)
-        ttk.Button(top, text="Scegli cartella…", command=self.choose_out_dir).pack(side="left")
+        self.mode = tk.StringVar(value="otsu")
+        self.fixed = tk.DoubleVar(value=0.65)
+        self.sau_w = tk.IntVar(value=25)
+        self.sau_k = tk.DoubleVar(value=0.2)
+        self.specks = tk.IntVar(value=0)
+        self.dilate = tk.IntVar(value=0)
 
-        tabs = ttk.Notebook(self)
-        tabs.pack(fill="both", expand=True)
+        self.sk_method = tk.StringVar(value="skeletonize")
+        self.min_obj = tk.IntVar(value=16)
+        self.do_close = tk.BooleanVar(value=False)
 
-        self.stage1 = Stage1Frame(tabs, self.base_out_dir)
-        self.stage2 = Stage2Frame(tabs, self.base_out_dir)
-        tabs.add(self.stage1, text="Fase 1: PDF → Immagini")
-        tabs.add(self.stage2, text="Fase 2: Cleaned → B/N")
+        self.dp_tol = tk.DoubleVar(value=1.0)
+        self.min_points = tk.IntVar(value=8)
+        self.close_gap = tk.IntVar(value=2)
+        self.sample_step = tk.DoubleVar(value=1.5)
 
-    def choose_out_dir(self):
-        d = filedialog.askdirectory()
+        self._build_ui()
+
+    def _pick_dir(self):
+        d = filedialog.askdirectory(initialdir=self.base_dir.get() or str(Path.home()))
         if d:
-            self.base_out_dir.set(d)
+            self.base_dir.set(d)
 
+    def _pick_pdf(self):
+        f = filedialog.askopenfilename(filetypes=[("PDF", "*.pdf")])
+        if f:
+            self.pdf_path.set(f)
 
-def main():
-    app = App()
-    app.mainloop()
+    def _run_thread(self, fn, *args):
+        th = threading.Thread(target=fn, args=args, daemon=True)
+        th.start()
 
+    def _build_ui(self):
+        nb = ttk.Notebook(self)
+        nb.pack(fill="both", expand=True)
+
+        # ------------- Fase 1 -------------
+        f1 = ttk.Frame(nb)
+        nb.add(f1, text="Fase 1: PDF ➜ cleaned")
+        frm = ttk.LabelFrame(f1, text="Parametri")
+        frm.pack(fill="x", padx=10, pady=8)
+
+        ttk.Label(frm, text="Cartella di output").grid(row=0, column=0, sticky="e", padx=6, pady=4)
+        ttk.Entry(frm, textvariable=self.base_dir, width=60).grid(row=0, column=1, sticky="we", padx=6, pady=4)
+        ttk.Button(frm, text="Sfoglia…", command=self._pick_dir).grid(row=0, column=2, padx=6, pady=4)
+
+        ttk.Label(frm, text="PDF").grid(row=1, column=0, sticky="e", padx=6, pady=4)
+        ttk.Entry(frm, textvariable=self.pdf_path, width=60).grid(row=1, column=1, sticky="we", padx=6, pady=4)
+        ttk.Button(frm, text="Apri PDF…", command=self._pick_pdf).grid(row=1, column=2, padx=6, pady=4)
+
+        ttk.Label(frm, text="DPI").grid(row=2, column=0, sticky="e", padx=6, pady=4)
+        ttk.Spinbox(frm, from_=150, to=1200, increment=50, textvariable=self.dpi, width=10).grid(row=2, column=1, sticky="w", padx=6, pady=4)
+
+        ttk.Checkbutton(frm, text="Anti‑griglia HSV", variable=self.anti_grid).grid(row=3, column=1, sticky="w", padx=6, pady=4)
+        ttk.Label(frm, text="S soglia").grid(row=4, column=0, sticky="e", padx=6, pady=4)
+        ttk.Entry(frm, textvariable=self.s_thr, width=8).grid(row=4, column=1, sticky="w", padx=6, pady=4)
+        ttk.Label(frm, text="V soglia").grid(row=5, column=0, sticky="e", padx=6, pady=4)
+        ttk.Entry(frm, textvariable=self.v_thr, width=8).grid(row=5, column=1, sticky="w", padx=6, pady=4)
+        ttk.Label(frm, text="Thicken").grid(row=6, column=0, sticky="e", padx=6, pady=4)
+        ttk.Spinbox(frm, from_=0, to=7, textvariable=self.thicken, width=8).grid(row=6, column=1, sticky="w", padx=6, pady=4)
+
+        self.log1 = tk.Text(f1, height=18)
+        self.log1.pack(fill="both", expand=True, padx=10, pady=8)
+
+        ttk.Button(f1, text="Esegui Fase 1", command=lambda: self._run_thread(
+            pdf_to_images, Path(self.pdf_path.get()), int(self.dpi.get()),
+            Path(self.base_dir.get()), bool(self.anti_grid.get()),
+            float(self.s_thr.get()), float(self.v_thr.get()), int(self.thicken.get()),
+            self.log1)).pack(pady=6)
+
+        # ------------- Fase 2 -------------
+        f2 = ttk.Frame(nb)
+        nb.add(f2, text="Fase 2: cleaned ➜ bw")
+        frm2 = ttk.LabelFrame(f2, text="Parametri")
+        frm2.pack(fill="x", padx=10, pady=8)
+
+        ttk.Label(frm2, text="Metodo").grid(row=0, column=0, sticky="e", padx=6, pady=4)
+        ttk.Combobox(frm2, values=["fixed","otsu","sauvola"], textvariable=self.mode, state="readonly").grid(row=0, column=1, sticky="w", padx=6, pady=4)
+        ttk.Label(frm2, text="Soglia fissa").grid(row=1, column=0, sticky="e", padx=6, pady=4)
+        ttk.Entry(frm2, textvariable=self.fixed, width=8).grid(row=1, column=1, sticky="w", padx=6, pady=4)
+        ttk.Label(frm2, text="Sauvola win").grid(row=2, column=0, sticky="e", padx=6, pady=4)
+        ttk.Spinbox(frm2, from_=9, to=101, increment=2, textvariable=self.sau_w, width=8).grid(row=2, column=1, sticky="w", padx=6, pady=4)
+        ttk.Label(frm2, text="Sauvola k").grid(row=3, column=0, sticky="e", padx=6, pady=4)
+        ttk.Entry(frm2, textvariable=self.sau_k, width=8).grid(row=3, column=1, sticky="w", padx=6, pady=4)
+        ttk.Label(frm2, text="Remove specks").grid(row=4, column=0, sticky="e", padx=6, pady=4)
+        ttk.Spinbox(frm2, from_=0, to=7, textvariable=self.specks, width=8).grid(row=4, column=1, sticky="w", padx=6, pady=4)
+        ttk.Label(frm2, text="Dilate px").grid(row=5, column=0, sticky="e", padx=6, pady=4)
+        ttk.Spinbox(frm2, from_=0, to=5, textvariable=self.dilate, width=8).grid(row=5, column=1, sticky="w", padx=6, pady=4)
+
+        self.log2 = tk.Text(f2, height=18)
+        self.log2.pack(fill="both", expand=True, padx=10, pady=8)
+
+        ttk.Button(f2, text="Esegui Fase 2", command=lambda: self._run_thread(
+            cleaned_to_bw, Path(self.base_dir.get()), self.mode.get(), float(self.fixed.get()),
+            int(self.sau_w.get()), float(self.sau_k.get()), int(self.specks.get()),
+            int(self.dilate.get()), self.log2
+        )).pack(pady=6)
+
+        # ------------- Fase 3 -------------
+        f3 = ttk.Frame(nb)
+        nb.add(f3, text="Fase 3: bw ➜ skeleton")
+        frm3 = ttk.LabelFrame(f3, text="Parametri")
+        frm3.pack(fill="x", padx=10, pady=8)
+
+        ttk.Label(frm3, text="Metodo").grid(row=0, column=0, sticky="e", padx=6, pady=4)
+        ttk.Combobox(frm3, values=["skeletonize","medial_axis"], textvariable=self.sk_method, state="readonly").grid(row=0, column=1, sticky="w", padx=6, pady=4)
+        ttk.Label(frm3, text="Min object").grid(row=1, column=0, sticky="e", padx=6, pady=4)
+        ttk.Spinbox(frm3, from_=0, to=256, textvariable=self.min_obj, width=8).grid(row=1, column=1, sticky="w", padx=6, pady=4)
+        ttk.Checkbutton(frm3, text="Binary closing 3×3", variable=self.do_close).grid(row=2, column=1, sticky="w", padx=6, pady=4)
+
+        self.log3 = tk.Text(f3, height=18)
+        self.log3.pack(fill="both", expand=True, padx=10, pady=8)
+
+        ttk.Button(f3, text="Esegui Fase 3", command=lambda: self._run_thread(
+            bw_to_skeleton, Path(self.base_dir.get()), self.sk_method.get(),
+            int(self.min_obj.get()), bool(self.do_close.get()), self.log3
+        )).pack(pady=6)
+
+        # ------------- Fase 4 -------------
+        f4 = ttk.Frame(nb)
+        nb.add(f4, text="Fase 4: skeleton ➜ strokes (JSON)")
+        frm4 = ttk.LabelFrame(f4, text="Parametri")
+        frm4.pack(fill="x", padx=10, pady=8)
+
+        ttk.Label(frm4, text="RDP tol (px)").grid(row=0, column=0, sticky="e", padx=6, pady=4)
+        ttk.Entry(frm4, textvariable=self.dp_tol, width=8).grid(row=0, column=1, sticky="w", padx=6, pady=4)
+        ttk.Label(frm4, text="Min points").grid(row=1, column=0, sticky="e", padx=6, pady=4)
+        ttk.Spinbox(frm4, from_=2, to=128, textvariable=self.min_points, width=8).grid(row=1, column=1, sticky="w", padx=6, pady=4)
+        ttk.Label(frm4, text="Close gap (px)").grid(row=2, column=0, sticky="e", padx=6, pady=4)
+        ttk.Spinbox(frm4, from_=0, to=6, textvariable=self.close_gap, width=8).grid(row=2, column=1, sticky="w", padx=6, pady=4)
+        ttk.Label(frm4, text="Sample step (px)").grid(row=3, column=0, sticky="e", padx=6, pady=4)
+        ttk.Entry(frm4, textvariable=self.sample_step, width=8).grid(row=3, column=1, sticky="w", padx=6, pady=4)
+
+        self.log4 = tk.Text(f4, height=18)
+        self.log4.pack(fill="both", expand=True, padx=10, pady=8)
+
+        ttk.Button(f4, text="Esegui Fase 4", command=lambda: self._run_thread(
+            skeletons_to_strokes, Path(self.base_dir.get()),
+            VecParams(dp_tol=float(self.dp_tol.get()),
+                      min_points=int(self.min_points.get()),
+                      close_gap=int(self.close_gap.get()),
+                      sample_step=float(self.sample_step.get())),
+            self.log4
+        )).pack(pady=6)
 
 if __name__ == "__main__":
-    main()
+    App().mainloop()
