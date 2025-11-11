@@ -377,7 +377,10 @@ class App(tk.Tk):
         messagebox.showinfo(
             'Calibrazione',
             'Si aprirà un overlay a schermo intero.'
-            'Clicca 1) angolo Alto-Sinistra e 2) angolo Basso-Destra del foglio in Samsung Notes.'
+            'Hai 3 secondi per cambiare finestra.\n'
+            'Dopo i 3 secondi, clicca:\n'
+            '1) angolo Alto-Sinistra\n'
+            '2) angolo Basso-Destra del foglio in Samsung Notes.\n'
             'Premi ESC per annullare.'
         )
         # Crea l'overlay DOPO la chiusura del messagebox e assicurati che sia visibile
@@ -386,7 +389,8 @@ class App(tk.Tk):
             ov.wait_visibility()
             ov.lift()
             ov.focus_force()
-        self.after(50, _open_overlay)
+        # Usa after invece di sleep per non bloccare la GUI
+        self.after(3000, _open_overlay)
 
     def on_points_captured(self, tl_xy: Tuple[int, int], br_xy: Tuple[int, int]):
         # Assicura che TL e BR siano correttamente ordinati
