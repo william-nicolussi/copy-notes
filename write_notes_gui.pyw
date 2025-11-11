@@ -176,6 +176,82 @@ class CalibOverlay(tk.Toplevel):
 # Finestra principale: Fase 1
 # -----------------------------
 
+
+
+class DryRunOverlay(tk.Toplevel):
+    """Overlay full‑screen semi‑trasparente per mostrare gli stroke mappati sul canvas reale
+    SENZA muovere il mouse. ESC per chiudere."""
+    def __init__(self, master, page: PageData, tl: Tuple[int,int], br: Tuple[int,int], limit: int = 999999, show_box: bool = True):
+        super().__init__(master)
+        self.page = page
+        self.tl = tl
+        self.br = br
+        self.limit = limit
+        self.show_box = show_box
+
+        self.overrideredirect(True)
+        try:
+            self.attributes('-alpha', 0.35)  # velo leggero: vedi Notes sotto
+        except Exception:
+            pass
+        self.attributes('-topmost', True)
+        try:
+            self.attributes('-fullscreen', True)
+        except Exception:
+            self.state('zoomed')
+
+        self.canvas = tk.Canvas(self, bg='black')
+        self.canvas.pack(fill='both', expand=True)
+        self.canvas.bind('<Escape>', self._close)
+        self.bind('<Escape>', self._close)
+
+        self.update_idletasks()
+        self.lift()
+        self.focus_force()
+        try:
+            self.grab_set_global()
+        except Exception:
+            self.grab_set()
+
+        self._draw()
+
+    def _close(self, _evt=None):
+        try:
+            self.grab_release()
+        except Exception:
+            pass
+        self.destroy()
+
+    def _draw(self):
+        self.canvas.delete('all')
+        # bordo canvas reale
+        if self.show_box:
+            self.canvas.create_rectangle(self.tl[0], self.tl[1], self.br[0], self.br[1], outline='#66ff66', width=2)
+        # mapping
+        sx = (self.br[0] - self.tl[0]) / float(max(1, self.page.width))
+        sy = (self.br[1] - self.tl[1]) / float(max(1, self.page.height))
+        drawn = 0
+        for s in self.page.strokes:
+            if drawn >= self.limit:
+                break
+            pts = s.points
+            n = len(pts)
+            if n == 0:
+                continue
+            flat = []
+            for (x, y) in pts:
+                px = self.tl[0] + x * sx
+                py = self.tl[1] + y * sy
+                flat.extend([px, py])
+            color = '#ff4040'
+            if n == 1:
+                (px, py) = flat
+                r = 2
+                self.canvas.create_oval(px-r, py-r, px+r, py+r, fill=color, outline='')
+            else:
+                self.canvas.create_line(*flat, fill=color, width=1, capstyle=tk.ROUND, joinstyle=tk.ROUND)
+            drawn += 1
+
 class App(tk.Tk):
     PREVIEW_MAX_STROKES = 1500  # nessun limite di default (era 1500)
 
@@ -199,6 +275,11 @@ class App(tk.Tk):
         self.nb.add(self.phase1, text='Fase 1 – JSON & Calibrazione')
 
         self._build_phase1()
+
+        # Fase 2 – Dry Run con calibrazione da file
+        self.phase2 = ttk.Frame(self.nb)
+        self.nb.add(self.phase2, text='Fase 2 – Dry Run')
+        self._build_phase2()
 
     # -------------------------
     # UI Fase 1
@@ -250,7 +331,101 @@ class App(tk.Tk):
         # Resize binding per ridisegnare alla dimensione nuova
         self.preview.bind('<Configure>', lambda e: self._redraw_preview())
 
+    
     # -------------------------
+    # Fase 2 – Dry Run con calibrazione da file
+    # -------------------------
+    def _build_phase2(self):
+        wrapper = ttk.Frame(self.phase2)
+        wrapper.pack(fill='both', expand=True, padx=8, pady=8)
+
+        left = ttk.Frame(wrapper)
+        left.pack(side='left', fill='y')
+
+        ttk.Label(left, text='Calibrazione:').pack(anchor='w')
+        self.var_calib_path = tk.StringVar(value='')
+        row = ttk.Frame(left)
+        row.pack(fill='x', pady=(2, 8))
+        ttk.Entry(row, textvariable=self.var_calib_path, width=40).pack(side='left', fill='x', expand=True)
+        ttk.Button(row, text='Scegli…', command=self.on_load_calibration_file).pack(side='left', padx=(6,0))
+
+        self.lbl_calib_info = ttk.Label(left, text='Nessuna calibrazione caricata')
+        self.lbl_calib_info.pack(anchor='w', pady=(4, 12))
+
+        ttk.Button(left, text='Dry run (overlay 3s)…', command=self.start_dry_run).pack(fill='x')
+
+        ttk.Label(left, text='Suggerimento: seleziona un JSON in Fase 1 per l\'anteprima/dry run.').pack(anchor='w', pady=(12, 0))
+
+        # area vuota a destra per futura anteprima locale
+        right = ttk.Frame(wrapper)
+        right.pack(side='left', fill='both', expand=True, padx=12)
+        ttk.Label(right, text='Questa fase non muove il mouse: mostra solo una sovrapposizione sullo schermo.').pack(anchor='w')
+
+    def on_load_calibration_file(self):
+        start_dir = self.folder_path or os.path.dirname(os.path.abspath(sys.argv[0]))
+        path = filedialog.askopenfilename(
+            title='Seleziona calibration.json',
+            initialdir=start_dir,
+            filetypes=[('JSON', '*.json')]
+        )
+        if not path:
+            return
+        try:
+            with open(path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+        except Exception as e:
+            messagebox.showerror('Errore', f'Impossibile leggere il file di calibrazione:\\n{e}')
+            return
+
+        # accetta chiavi tl/br come liste [x,y] o tuple
+        try:
+            tl = tuple(data['tl'])
+            br = tuple(data['br'])
+            page_w = int(data.get('page_width', 0))
+            page_h = int(data.get('page_height', 0))
+        except Exception as e:
+            messagebox.showerror('Errore calibrazione', f'Formato non valido: {e}')
+            return
+
+        self.screen_tl = (int(tl[0]), int(tl[1]))
+        self.screen_br = (int(br[0]), int(br[1]))
+        self.var_calib_path.set(path)
+        self.lbl_calib_info.configure(text=f"TL={self.screen_tl}, BR={self.screen_br}, page=({page_w}×{page_h})")
+        # aggiorna label anche in fase 1
+        try:
+            self.lbl_canvas.configure(text=f'Canvas TL/BR: {self.screen_tl} → {self.screen_br}')
+            if self.current_index >= 0 and self.current_index < len(self.pages):
+                page = self.pages[self.current_index]
+                sx = (self.screen_br[0] - self.screen_tl[0]) / float(max(1, page.width))
+                sy = (self.screen_br[1] - self.screen_tl[1]) / float(max(1, page.height))
+                self.lbl_scale.configure(text=f'Scala Sx/Sy: {sx:.3f}, {sy:.3f}')
+        except Exception:
+            pass
+
+    def start_dry_run(self):
+        if self.current_index < 0 or self.current_index >= len(self.pages):
+            messagebox.showwarning('Seleziona un JSON', 'Seleziona prima un JSON in Fase 1.')
+            return
+        if not (self.screen_tl and self.screen_br):
+            messagebox.showwarning('Calibrazione mancante', 'Carica una calibrazione (calibration.json) in Fase 2 oppure esegui la calibrazione in Fase 1.')
+            return
+
+        # Messaggio e delay 3 secondi per cambiare finestra
+        messagebox.showinfo(
+            'Dry run',
+            'Hai 3 secondi per cambiare finestra.\n'
+            'Verrà mostrata una sovrapposizione dei tratti sullo schermo calibrato.\n'
+            'Premi ESC per chiudere l\'overlay.'
+        )
+
+        def _open():
+            page = self.pages[self.current_index]
+            ov = DryRunOverlay(self, page, self.screen_tl, self.screen_br)
+            ov.lift()
+            ov.focus_force()
+
+        self.after(3000, _open)
+# -------------------------
     # Loader JSON
     # -------------------------
     def on_select_folder(self):
@@ -377,10 +552,7 @@ class App(tk.Tk):
         messagebox.showinfo(
             'Calibrazione',
             'Si aprirà un overlay a schermo intero.'
-            'Hai 3 secondi per cambiare finestra.\n'
-            'Dopo i 3 secondi, clicca:\n'
-            '1) angolo Alto-Sinistra\n'
-            '2) angolo Basso-Destra del foglio in Samsung Notes.\n'
+            'Clicca 1) angolo Alto-Sinistra e 2) angolo Basso-Destra del foglio in Samsung Notes.'
             'Premi ESC per annullare.'
         )
         # Crea l'overlay DOPO la chiusura del messagebox e assicurati che sia visibile
@@ -389,7 +561,6 @@ class App(tk.Tk):
             ov.wait_visibility()
             ov.lift()
             ov.focus_force()
-        # Usa after invece di sleep per non bloccare la GUI
         self.after(3000, _open_overlay)
 
     def on_points_captured(self, tl_xy: Tuple[int, int], br_xy: Tuple[int, int]):
