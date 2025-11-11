@@ -1,30 +1,24 @@
 #!/usr/bin/env pythonw
 # -*- coding: utf-8 -*-
 """
-Clean Notes GUI — PDF ➜ Images ➜ B/W ➜ Skeleton ➜ Vector Strokes (JSON)
-
-Fase 1: PDF -> immagini (original) con anti‑griglia opzionale -> cleaned
-Fase 2: cleaned -> bianco/nero (bw) con Otsu/Sauvola
-Fase 3: bw -> skeleton (1px) via skimage (skeletonize/medial_axis) -> bw_skel
-Fase 4: skeleton -> vettori (polilinee) con grafo 8‑connesso, RDP semplificazione, sampling -> strokes/*.json
+Clean Notes GUI — v4 SEG (segmentazione pura)
+PDF ➜ Images ➜ B/W ➜ Skeleton ➜ Strokes (segmentazione senza semplificazioni)
+- Fase 4 ora decompone lo skeleton in cammini massimi tra nodi non-2 (endpoint/giunzioni) e gestisce i "dot" isolati.
+- Nessuna semplificazione geometrica, nessun resampling, nessun close-gap, nessun filtro lunghezza.
+- Preview opzionale: overlay dei tratti su skeleton e copia delle BW.
 
 Dipendenze:
   pip install pymupdf opencv-python numpy scikit-image pillow
-
-Note:
-- Il codice è standalone e non dipende dal tuo file precedente. Salva output in sottocartelle della cartella scelta.
-- JSON di output: {"width":W,"height":H,"strokes":[{"type":"polyline","closed":bool,"points":[[x,y],...]},...]}
 """
 
-import os, json, math, threading
+import os, json, threading
 from pathlib import Path
 from dataclasses import dataclass
 import tkinter as tk
-from tkinter import ttk, filedialog, messagebox
+from tkinter import ttk, filedialog
 
 import numpy as np
 import cv2
-from PIL import Image
 
 # -----------------------
 # Utilities
@@ -47,7 +41,6 @@ def log_append(text_widget: tk.Text, msg: str):
 # -----------------------
 
 def hsv_antigrid_keep_ink_bgr(img_bgr: np.ndarray, s_thr=0.26, v_thr=0.65, thicken=2) -> np.ndarray:
-    """Preserva inchiostro (S alta o V basso) e schiarisce il resto."""
     img = img_bgr.astype(np.float32) / 255.0
     cmax = img.max(axis=2)
     cmin = img.min(axis=2)
@@ -101,7 +94,6 @@ def auto_white_background(bw_0_255: np.ndarray) -> np.ndarray:
     return bw_0_255
 
 def sauvola_threshold(gray01: np.ndarray, window: int = 25, k: float = 0.2, R: float = 0.5) -> np.ndarray:
-    """Mappa di soglia Sauvola su float [0..1]."""
     from scipy.ndimage import uniform_filter
     mean = uniform_filter(gray01, size=window, mode='reflect')
     mean_sq = uniform_filter(gray01 * gray01, size=window, mode='reflect')
@@ -110,10 +102,12 @@ def sauvola_threshold(gray01: np.ndarray, window: int = 25, k: float = 0.2, R: f
     th = mean * (1 + k * (std / (R + 1e-6) - 1))
     return th
 
-def cleaned_to_bw(base: Path, mode: str, fixed: float, sau_w: int, sau_k: float, specks: int, dilate_px: int, logw: tk.Text):
+def cleaned_to_bw(base: Path, mode: str, fixed: float, sau_w: int, sau_k: float, specks: int, dilate_px: int, preview_bw: bool, logw: tk.Text):
     ensure_dirs(base)
     inp = base / "cleaned"
     out = base / "bw"
+    if preview_bw:
+        (base / "bw_preview").mkdir(parents=True, exist_ok=True)
     files = sorted([p for p in inp.glob("*.png")])
     if not files:
         log_append(logw, "[F2] Nessuna immagine in cleaned/")
@@ -126,21 +120,23 @@ def cleaned_to_bw(base: Path, mode: str, fixed: float, sau_w: int, sau_k: float,
         elif mode == "otsu":
             g8 = (gray * 255).astype(np.uint8)
             _, bw = cv2.threshold(g8, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-            bw = (255 - bw)  # inchiostro nero
+            bw = (255 - bw)
         else:
             th_map = sauvola_threshold(gray, window=int(sau_w), k=float(sau_k), R=0.5)
             bw = ((gray < th_map).astype(np.uint8)) * 255
-
         if specks and specks > 0:
             k = cv2.getStructuringElement(cv2.MORPH_RECT, (specks, specks))
             bw = cv2.morphologyEx(bw, cv2.MORPH_OPEN, k, iterations=1)
         if dilate_px and dilate_px > 0:
             k = cv2.getStructuringElement(cv2.MORPH_RECT, (dilate_px, dilate_px))
             bw = cv2.dilate(bw, k, iterations=1)
-
         bw = auto_white_background(bw)
-        cv2.imwrite((out / p.name).as_posix(), bw)
-        log_append(logw, f"[F2] bw: {p.name}")
+        outp = (out / p.name)
+        cv2.imwrite(outp.as_posix(), bw)
+        if preview_bw:
+            prevp = (base / "bw_preview" / p.name)
+            cv2.imwrite(prevp.as_posix(), bw)
+        log_append(logw, f"[F2] bw: {p.name}" + (" [preview]" if preview_bw else ""))
     log_append(logw, "[F2] Completato.")
 
 # -----------------------
@@ -176,257 +172,171 @@ def bw_to_skeleton(base: Path, method: str, min_obj: int, do_close: bool, logw: 
         else:
             sk, _ = medial_axis(mask, return_distance=True)
         sk_img = (sk.astype(np.uint8) * 255)
-        cv2.imwrite((out / p.name).as_posix(), 255 - sk_img)  # nero=tratto
+        cv2.imwrite((out / p.name).as_posix(), 255 - sk_img)
         log_append(logw, f"[F3] skeleton: {p.name}")
     log_append(logw, "[F3] Completato.")
 
 # -----------------------
-# Fase 4: Vectorization (Skeleton -> Strokes JSON)
+# Fase 4: Segmentazione pura (Skeleton -> Strokes JSON)
 # -----------------------
-
-@dataclass
-class VecParams:
-    dp_tol: float = 1.0      # tolleranza Douglas–Peucker in px
-    min_points: int = 8      # scarta polilinee troppo corte
-    close_gap: int = 2       # ricuce gap (px) tra endpoint
-    sample_step: float = 1.5 # distanza target tra punti consecutivi
 
 def neighbors8(y, x, H, W):
     for dy in (-1, 0, 1):
         for dx in (-1, 0, 1):
-            if dy == 0 and dx == 0: 
+            if dy == 0 and dx == 0:
                 continue
             ny, nx = y + dy, x + dx
             if 0 <= ny < H and 0 <= nx < W:
                 yield ny, nx
 
-def build_graph_from_skeleton(mask: np.ndarray, close_gap: int):
-    """mask True=ink skeleton. Restituisce: coords list, adjacency dict {idx: set(idx)}"""
+def build_graph(mask: np.ndarray):
+    """mask True=ink. Restituisce coords (N,2: y,x), adj dict, idx_map"""
     H, W = mask.shape
-    coords = []               # idx -> (y,x)
-    index = -np.ones_like(mask, dtype=np.int32)  # -1=non nodo
     ys, xs = np.where(mask)
-    idx = 0
-    for y, x in zip(ys, xs):
-        index[y, x] = idx
-        coords.append((int(y), int(x)))
-        idx += 1
-    coords = np.array(coords, dtype=np.int32)
-    adj = {i: set() for i in range(idx)}
-    for y, x in zip(ys, xs):
-        i = int(index[y, x])
+    N = len(ys)
+    idx_map = -np.ones((H, W), dtype=np.int32)
+    coords = np.empty((N, 2), dtype=np.int32)
+    for i, (y, x) in enumerate(zip(ys, xs)):
+        idx_map[y, x] = i
+        coords[i] = (y, x)
+    adj = {i: set() for i in range(N)}
+    for i, (y, x) in enumerate(coords):
         for ny, nx in neighbors8(y, x, H, W):
-            if index[ny, nx] >= 0:
-                j = int(index[ny, nx])
-                if i != j:
-                    adj[i].add(j)
-    # gap closing: collega endpoint vicini entro r
-    if close_gap and close_gap > 0:
-        endpoints = [i for i in range(idx) if len(adj[i]) == 1]
-        # naive: k-d tree semplice con numpy
-        ep_coords = coords[endpoints] if endpoints else np.zeros((0,2), np.int32)
-        for a, ia in enumerate(endpoints):
-            ya, xa = ep_coords[a]
-            # cerca in un quadrato r
-            y0, y1 = max(0, ya-close_gap), min(H-1, ya+close_gap)
-            x0, x1 = max(0, xa-close_gap), min(W-1, xa+close_gap)
-            sub = index[y0:y1+1, x0:x1+1]
-            cand = np.unique(sub[sub>=0])
-            for j in cand:
-                if j == ia: 
-                    continue
-                # collega solo endpoint o pixel molto vicini
-                yb, xb = coords[j]
-                if (abs(ya - yb) + abs(xa - xb)) <= close_gap:
-                    adj[ia].add(int(j))
-                    adj[int(j)].add(ia)
-    return coords, adj, index
+            j = idx_map[ny, nx]
+            if j >= 0 and j != i:
+                adj[i].add(j)
+    return coords, adj, idx_map
 
-def douglas_peucker(points, eps):
-    """RDP su array Nx2 (y,x) — ritorna punti semplificati nell'ordine originale."""
-    if len(points) < 3:
-        return points
-    # distanza punto-linea
-    (y1, x1) = points[0]
-    (y2, x2) = points[-1]
-    vy = y2 - y1
-    vx = x2 - x1
-    vnorm = math.hypot(vy, vx) + 1e-9
-    dmax = -1.0
-    idx = -1
-    for i in range(1, len(points)-1):
-        py, px = points[i]
-        # area parallelogramma / base
-        dist = abs(vy*(px - x1) - vx*(py - y1)) / vnorm
-        if dist > dmax:
-            dmax = dist
-            idx = i
-    if dmax > eps:
-        left = douglas_peucker(points[:idx+1], eps)
-        right = douglas_peucker(points[idx:], eps)
-        return np.vstack([left[:-1], right])
-    else:
-        return np.array([points[0], points[-1]])
-
-def resample_polyline(points, step):
-    """Campiona lungo la lunghezza a passo ~step (in px)."""
-    if len(points) <= 2 or step <= 0:
-        return points
-    pts = points.astype(np.float32)
-    dists = np.sqrt(((pts[1:] - pts[:-1])**2).sum(axis=1))
-    cum = np.concatenate([[0.0], np.cumsum(dists)])
-    L = cum[-1]
-    if L <= step:
-        return points
-    targets = np.arange(0.0, L, step)
-    out = []
-    k = 0
-    for t in targets:
-        while not (cum[k] <= t <= cum[k+1]):
-            k += 1
-            if k >= len(dists):
-                break
-        if k >= len(dists):
-            break
-        a, b = pts[k], pts[k+1]
-        seg = cum[k+1] - cum[k]
-        alpha = 0.0 if seg == 0 else (t - cum[k]) / seg
-        out.append(a + alpha*(b - a))
-    out.append(pts[-1])
-    return np.round(np.vstack(out)).astype(np.int32)
-
-def trace_polylines_from_graph(coords: np.ndarray, adj: dict, params: VecParams):
-    N = coords.shape[0]
-    visited_edge = set()  # edges as tuple(min,max)
+def decompose_paths(coords, adj):
+    """Decompone il grafo in cammini massimi e loop; include DOT per isolati."""
+    N = len(coords)
     deg = np.array([len(adj[i]) for i in range(N)], dtype=np.int32)
-    endpoints = [i for i in range(N) if deg[i] == 1]
-    junctions = set(i for i in range(N) if deg[i] >= 3)
-    polylines = []
+    visited = set()  # edges (min,max)
+    paths = []       # lista di liste di indici
+    dots = []        # indici isolati (deg==0)
 
-    def take_edge(a, b):
+    # Gestisci isolati
+    for i in range(N):
+        if deg[i] == 0:
+            dots.append(i)
+
+    def take(a, b):
         e = (a, b) if a < b else (b, a)
-        if e in visited_edge:
+        if e in visited:
             return False
-        visited_edge.add(e)
+        visited.add(e)
         return True
 
-    def walk_from(start):
-        # trova un vicino per partire
-        if not adj[start]:
-            return
-        path = [start]
-        # scegli il primo vicino non visitato
-        nxts = sorted(list(adj[start]), key=lambda j: abs(j-start))
-        prev = start
-        cur = nxts[0]
-        if not take_edge(prev, cur):
-            return
-        path.append(cur)
-        while True:
-            # cerca prossimo vicino diverso da prev
-            neigh = [k for k in adj[cur] if k != prev]
-            # prediligi angolo più piccolo
-            if len(neigh) == 0:
-                break
-            best = None
-            if len(neigh) == 1:
-                cand = neigh[0]
-            else:
-                # minimizza deviazione angolare
-                v1 = coords[cur] - coords[prev]
-                ang_best = 1e9
-                cand = neigh[0]
-                for nb in neigh:
-                    v2 = coords[nb] - coords[cur]
-                    num = float(np.dot(v1, v2))
-                    den = (np.linalg.norm(v1)*np.linalg.norm(v2) + 1e-9)
-                    cosang = -num/den  # vogliamo deviazione minima => cos vicino a -1 (continuare dritto)
-                    if cosang < ang_best:
-                        ang_best = cosang
-                        cand = nb
-            if not take_edge(cur, cand):
-                break
-            path.append(cand)
-            prev, cur = cur, cand
-            if cur in junctions:
-                break
-        polylines.append(path)
+    # Cammini da nodi con deg != 2 (endpoint e giunzioni)
+    seeds = [i for i in range(N) if deg[i] != 2 and deg[i] > 0]
+    for s in seeds:
+        for nb in list(adj[s]):
+            if not take(s, nb):
+                continue
+            path = [s, nb]
+            prev, cur = s, nb
+            while True:
+                # prosegui finché sei in catena (deg==2)
+                nexts = [k for k in adj[cur] if k != prev]
+                if deg[cur] != 2 or len(nexts) == 0:
+                    break
+                nxt = nexts[0] if len(nexts) == 1 else nexts[0]  # non importa quale: copriamo tutto
+                if not take(cur, nxt):
+                    break
+                path.append(nxt)
+                prev, cur = cur, nxt
+            paths.append(path)
 
-    # 1) percorsi da endpoint
-    for s in endpoints:
-        # controlla se ha ancora edge liberi
-        free = [j for j in adj[s] if ((min(s,j), max(s,j)) not in visited_edge)]
-        if free:
-            walk_from(s)
-
-    # 2) loop residui (nessun endpoint)
+    # Loop residui (componenti con tutti deg==2)
     for i in range(N):
         for j in adj[i]:
-            e = (min(i,j), max(i,j))
-            if e not in visited_edge:
-                # traccia piccolo ciclo
-                path = [i, j]
-                visited_edge.add(e)
-                prev, cur = i, j
-                while True:
-                    neigh = [k for k in adj[cur] if k != prev]
-                    if not neigh:
-                        break
-                    cand = neigh[0]
-                    e2 = (min(cur, cand), max(cur, cand))
-                    if e2 in visited_edge:
-                        break
-                    visited_edge.add(e2)
-                    path.append(cand)
-                    prev, cur = cur, cand
-                    if cand == i:
-                        break
-                polylines.append(path)
+            e = (i, j) if i < j else (j, i)
+            if e in visited:
+                continue
+            # avvia un giro lungo il loop
+            take(i, j)
+            path = [i, j]
+            prev, cur = i, j
+            while True:
+                nexts = [k for k in adj[cur] if k != prev]
+                if not nexts:
+                    break
+                nxt = nexts[0]
+                if not take(cur, nxt):
+                    break
+                path.append(nxt)
+                prev, cur = cur, nxt
+                if nxt == i:
+                    break
+            paths.append(path)
 
-    # converti indici in coordinate e applica pulizia/semplificazione
-    out = []
-    for path in polylines:
-        if len(path) < params.min_points:
-            continue
-        pts = coords[np.array(path, dtype=np.int32)][:, ::-1]  # (x,y) per comodità output
-        # RDP in (x,y) ma la nostra distanza usa (y,x); convertiamo
-        pts_yx = pts[:, ::-1]  # (y,x) per coerenza con resample
-        simp = douglas_peucker(pts_yx, params.dp_tol)
-        rs = resample_polyline(simp, params.sample_step)
-        if len(rs) < params.min_points:
-            continue
-        # chiusura se primo/ultimo vicini
-        closed = np.linalg.norm(rs[0] - rs[-1]) <= max(2, int(params.dp_tol*2))
-        # output come (x,y)
-        rs_xy = rs[:, ::-1].tolist()
-        out.append({"type": "polyline", "closed": bool(closed), "points": rs_xy})
-    return out
+    return paths, dots
 
-def skeletons_to_strokes(base: Path, params: VecParams, logw: tk.Text):
+def draw_strokes_preview_on_skeleton(sk_path: Path, strokes: list, dots: list, out_path: Path,
+                                     poly_color=(0,0,255), dot_color=(0,255,0), dot_radius=2, thickness=1):
+    base = cv2.imread(sk_path.as_posix(), cv2.IMREAD_GRAYSCALE)
+    if base is None:
+        return
+    color_img = cv2.cvtColor(base, cv2.COLOR_GRAY2BGR)
+    # polilinee
+    for st in strokes:
+        pts = np.array(st["points"], dtype=np.int32).reshape(-1,1,2)
+        cv2.polylines(color_img, [pts], isClosed=bool(st.get("closed", False)),
+                      color=poly_color, thickness=thickness, lineType=cv2.LINE_AA)
+    # dots
+    for d in dots:
+        x, y = d["point"]
+        cv2.circle(color_img, (int(x), int(y)), dot_radius, dot_color, -1, lineType=cv2.LINE_AA)
+    cv2.imwrite(out_path.as_posix(), color_img)
+
+def skeletons_to_strokes_segment(base: Path, preview_strokes: bool, logw: tk.Text):
     ensure_dirs(base)
     inp = base / "bw_skel"
     out_dir = base / "strokes"
+    prev_dir = base / "strokes_preview"
+    if preview_strokes:
+        prev_dir.mkdir(parents=True, exist_ok=True)
     files = sorted([p for p in inp.glob("*.png")])
     if not files:
         log_append(logw, "[F4] Nessun file in bw_skel/")
         return
     for p in files:
         sk = cv2.imread(p.as_posix(), cv2.IMREAD_GRAYSCALE)
-        # inchiostro nero -> mask True
         mask = (sk < 128)
         H, W = mask.shape
-        coords, adj, _ = build_graph_from_skeleton(mask, close_gap=params.close_gap)
-        strokes = trace_polylines_from_graph(coords, adj, params)
+        coords, adj, _ = build_graph(mask)
+        paths, dot_idx = decompose_paths(coords, adj)
+
+        strokes = []
+        for path in paths:
+            # converti in (x,y)
+            pts_xy = np.array([coords[i][::-1] for i in path], dtype=np.int32).tolist()
+            closed = (len(path) >= 3 and path[0] == path[-1])
+            strokes.append({"type": "polyline", "closed": bool(closed), "points": pts_xy})
+
+        dots = []
+        for i in dot_idx:
+            x, y = int(coords[i][1]), int(coords[i][0])
+            dots.append({"type": "dot", "point": [x, y]})
+
         payload = {
             "width": int(W),
             "height": int(H),
-            "strokes": strokes
+            "strokes": strokes,
+            "dots": dots
         }
         outp = out_dir / (p.stem + ".json")
         with open(outp, "w", encoding="utf-8") as f:
             json.dump(payload, f, separators=(",", ":"), ensure_ascii=False)
+
         kb = (outp.stat().st_size + 1023)//1024
-        log_append(logw, f"[F4] strokes: {outp.name} ({kb} KB, {len(strokes)} stroke)")
+        log_append(logw, f"[F4] strokes: {outp.name} ({kb} KB, {len(strokes)} stroke, {len(dots)} dots)")
+
+        if preview_strokes:
+            prevp = prev_dir / (p.stem + "_preview.png")
+            draw_strokes_preview_on_skeleton(p, strokes, dots, prevp,
+                                             poly_color=(0,0,255), dot_color=(0,200,0),
+                                             dot_radius=2, thickness=1)
     log_append(logw, "[F4] Completato.")
 
 # -----------------------
@@ -436,11 +346,11 @@ def skeletons_to_strokes(base: Path, params: VecParams, logw: tk.Text):
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("Clean Notes GUI — Fasi 1-4")
-        self.geometry("980x720")
-        self.minsize(900, 650)
+        self.title("Clean Notes GUI — Fasi 1-4 (Segmentazione pura)")
+        self.geometry("1000x760")
+        self.minsize(920, 680)
 
-        self.base_dir = tk.StringVar(value=str(Path.home() / "CleanNotesOut"))
+        self.base_dir = tk.StringVar(value=str(Path(__file__).resolve().parent))
         self.pdf_path = tk.StringVar(value="")
         self.dpi = tk.IntVar(value=600)
         self.anti_grid = tk.BooleanVar(value=True)
@@ -454,15 +364,13 @@ class App(tk.Tk):
         self.sau_k = tk.DoubleVar(value=0.2)
         self.specks = tk.IntVar(value=0)
         self.dilate = tk.IntVar(value=0)
+        self.preview_bw = tk.BooleanVar(value=False)
 
         self.sk_method = tk.StringVar(value="skeletonize")
         self.min_obj = tk.IntVar(value=16)
         self.do_close = tk.BooleanVar(value=False)
 
-        self.dp_tol = tk.DoubleVar(value=1.0)
-        self.min_points = tk.IntVar(value=8)
-        self.close_gap = tk.IntVar(value=2)
-        self.sample_step = tk.DoubleVar(value=1.5)
+        self.preview_strokes = tk.BooleanVar(value=True)
 
         self._build_ui()
 
@@ -536,6 +444,7 @@ class App(tk.Tk):
         ttk.Spinbox(frm2, from_=0, to=7, textvariable=self.specks, width=8).grid(row=4, column=1, sticky="w", padx=6, pady=4)
         ttk.Label(frm2, text="Dilate px").grid(row=5, column=0, sticky="e", padx=6, pady=4)
         ttk.Spinbox(frm2, from_=0, to=5, textvariable=self.dilate, width=8).grid(row=5, column=1, sticky="w", padx=6, pady=4)
+        ttk.Checkbutton(frm2, text="See preview (bw_preview)", variable=self.preview_bw).grid(row=6, column=1, sticky="w", padx=6, pady=4)
 
         self.log2 = tk.Text(f2, height=18)
         self.log2.pack(fill="both", expand=True, padx=10, pady=8)
@@ -543,7 +452,7 @@ class App(tk.Tk):
         ttk.Button(f2, text="Esegui Fase 2", command=lambda: self._run_thread(
             cleaned_to_bw, Path(self.base_dir.get()), self.mode.get(), float(self.fixed.get()),
             int(self.sau_w.get()), float(self.sau_k.get()), int(self.specks.get()),
-            int(self.dilate.get()), self.log2
+            int(self.dilate.get()), bool(self.preview_bw.get()), self.log2
         )).pack(pady=6)
 
         # ------------- Fase 3 -------------
@@ -568,29 +477,19 @@ class App(tk.Tk):
 
         # ------------- Fase 4 -------------
         f4 = ttk.Frame(nb)
-        nb.add(f4, text="Fase 4: skeleton ➜ strokes (JSON)")
-        frm4 = ttk.LabelFrame(f4, text="Parametri")
+        nb.add(f4, text="Fase 4: skeleton ➜ strokes (SEG)")
+        frm4 = ttk.LabelFrame(f4, text="Opzioni")
         frm4.pack(fill="x", padx=10, pady=8)
 
-        ttk.Label(frm4, text="RDP tol (px)").grid(row=0, column=0, sticky="e", padx=6, pady=4)
-        ttk.Entry(frm4, textvariable=self.dp_tol, width=8).grid(row=0, column=1, sticky="w", padx=6, pady=4)
-        ttk.Label(frm4, text="Min points").grid(row=1, column=0, sticky="e", padx=6, pady=4)
-        ttk.Spinbox(frm4, from_=2, to=128, textvariable=self.min_points, width=8).grid(row=1, column=1, sticky="w", padx=6, pady=4)
-        ttk.Label(frm4, text="Close gap (px)").grid(row=2, column=0, sticky="e", padx=6, pady=4)
-        ttk.Spinbox(frm4, from_=0, to=6, textvariable=self.close_gap, width=8).grid(row=2, column=1, sticky="w", padx=6, pady=4)
-        ttk.Label(frm4, text="Sample step (px)").grid(row=3, column=0, sticky="e", padx=6, pady=4)
-        ttk.Entry(frm4, textvariable=self.sample_step, width=8).grid(row=3, column=1, sticky="w", padx=6, pady=4)
+        self.preview_strokes = tk.BooleanVar(value=True)
+        ttk.Checkbutton(frm4, text="See preview (strokes_preview)", variable=self.preview_strokes).grid(row=0, column=1, sticky="w", padx=6, pady=4)
 
         self.log4 = tk.Text(f4, height=18)
         self.log4.pack(fill="both", expand=True, padx=10, pady=8)
 
-        ttk.Button(f4, text="Esegui Fase 4", command=lambda: self._run_thread(
-            skeletons_to_strokes, Path(self.base_dir.get()),
-            VecParams(dp_tol=float(self.dp_tol.get()),
-                      min_points=int(self.min_points.get()),
-                      close_gap=int(self.close_gap.get()),
-                      sample_step=float(self.sample_step.get())),
-            self.log4
+        ttk.Button(f4, text="Esegui Fase 4 (segmentazione pura)", command=lambda: self._run_thread(
+            skeletons_to_strokes_segment, Path(self.base_dir.get()),
+            bool(self.preview_strokes.get()), self.log4
         )).pack(pady=6)
 
 if __name__ == "__main__":
