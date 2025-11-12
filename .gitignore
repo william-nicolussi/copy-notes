@@ -1,0 +1,13 @@
+# Cartelle da non tracciare
+rendered/
+Old/
+simplified/
+CleanNotes/
+
+# File specifici da ignorare
+clean_notes.py
+clean_notes_gui.pyw
+write_notes_gui.pyw
+
+# Altri file generati / output
+*.pdf
